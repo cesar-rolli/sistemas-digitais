@@ -1,0 +1,231 @@
+// =============================================================================
+// wm8731_i2c_config.v
+// Configura o WM8731 via I2C (bit-bang) na inicialização.
+// Endereço I2C do WM8731: 0x1A (CSAD = GND na DE2)
+//
+// Registradores programados:
+//   R0  : Left Line In  = 0x1F (volume máx, mute off)
+//   R1  : Right Line In = 0x1F
+//   R4  : Analog Path   = 0x14 (Line-in selec, DAC on)
+//   R5  : Digital Path  = 0x00 (sem HPF, sem mute)
+//   R6  : Power Down    = 0x00 (tudo ligado)
+//   R7  : Format        = 0x0E (I2S, 16-bit, master)
+//   R8  : Sampling      = 0x00 (USB mode, 48 kHz, MCLK = 12.288 MHz)
+//   R9  : Active        = 0x01 (ativa o CODEC)
+// =============================================================================
+module wm8731_i2c_config (
+    input  wire       clk,    // 50 MHz
+    input  wire       rst,
+    output reg        scl,
+    inout  wire       sda,
+    output reg        done
+);
+
+// I2C a ~100 kHz: divide 50 MHz por 500
+localparam DIVIDER = 500;
+localparam HALF    = DIVIDER / 2;
+
+// Endereço do WM8731 no barramento (7 bits) + bit de escrita
+localparam WM_ADDR = 7'h1A;
+
+// Tabela de registradores a escrever: {reg[6:0], data[8:0]}
+// Codificados como palavras de 16 bits: [15:9]=reg_addr, [8:0]=reg_data
+reg [15:0] reg_table [0:7];
+initial begin
+    reg_table[0] = {7'h00, 9'h01F};  // R0  Left Line In  vol=31, LIN-mute=off
+    reg_table[1] = {7'h01, 9'h01F};  // R1  Right Line In vol=31
+    reg_table[2] = {7'h04, 9'h014};  // R4  Analog Path: LINSEL, DACSEL
+    reg_table[3] = {7'h05, 9'h000};  // R5  Digital Path: tudo off
+    reg_table[4] = {7'h06, 9'h000};  // R6  Power Down: tudo ativo
+    reg_table[5] = {7'h07, 9'h00E};  // R7  Format: I2S, 16-bit, master
+    reg_table[6] = {7'h08, 9'h000};  // R8  Sampling: USB 48kHz
+    reg_table[7] = {7'h09, 9'h001};  // R9  Active Interface
+end
+
+// Geração do clock I2C
+reg [$clog2(DIVIDER)-1:0] clk_cnt;
+reg i2c_clk;
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        clk_cnt <= 0;
+        i2c_clk <= 1'b0;
+    end else begin
+        if (clk_cnt == DIVIDER-1) begin
+            clk_cnt <= 0;
+            i2c_clk <= ~i2c_clk;
+        end else
+            clk_cnt <= clk_cnt + 1;
+    end
+end
+
+// Detecção de borda do clock I2C
+reg i2c_clk_r;
+always @(posedge clk) i2c_clk_r <= i2c_clk;
+wire i2c_rise = ( i2c_clk && !i2c_clk_r);
+wire i2c_fall = (!i2c_clk &&  i2c_clk_r);
+
+// Estado da máquina
+localparam S_IDLE   = 4'd0,
+           S_START  = 4'd1,
+           S_ADDR   = 4'd2,
+           S_WACK1  = 4'd3,
+           S_REG_HI = 4'd4,
+           S_WACK2  = 4'd5,
+           S_REG_LO = 4'd6,
+           S_WACK3  = 4'd7,
+           S_STOP   = 4'd8,
+           S_NEXT   = 4'd9,
+           S_DONE   = 4'd10;
+
+reg [3:0] state;
+reg [3:0] reg_idx;    // índice no reg_table (0..7)
+reg [2:0] bit_cnt;    // contador de bits (0..7)
+reg [7:0] shift_reg;  // byte sendo transmitido
+reg       sda_out;
+reg       sda_oe;     // output enable para SDA (open-drain)
+
+assign sda = sda_oe ? sda_out : 1'bz;
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        state   <= S_IDLE;
+        reg_idx <= 4'd0;
+        done    <= 1'b0;
+        scl     <= 1'b1;
+        sda_out <= 1'b1;
+        sda_oe  <= 1'b1;
+    end else begin
+        case (state)
+            // ----------------------------------------------------------------
+            S_IDLE: begin
+                scl     <= 1'b1;
+                sda_out <= 1'b1;
+                sda_oe  <= 1'b1;
+                if (!done)
+                    state <= S_START;
+            end
+
+            // ----------------------------------------------------------------
+            // START: SDA cai enquanto SCL está alto
+            S_START: begin
+                if (i2c_fall) begin
+                    sda_out <= 1'b0;      // SDA baixo
+                    state   <= S_ADDR;
+                    bit_cnt <= 3'd7;
+                    // Byte de endereço: 7 bits addr + R/W=0
+                    shift_reg <= {WM_ADDR, 1'b0};
+                end
+                scl <= i2c_clk;
+            end
+
+            // ----------------------------------------------------------------
+            // Transmite 8 bits de endereço
+            S_ADDR: begin
+                scl     <= i2c_clk;
+                if (i2c_fall) begin
+                    sda_out <= shift_reg[7];
+                    sda_oe  <= 1'b1;
+                    shift_reg <= {shift_reg[6:0], 1'b0};
+                    if (bit_cnt == 3'd0)
+                        state <= S_WACK1;
+                    else
+                        bit_cnt <= bit_cnt - 3'd1;
+                end
+            end
+
+            // ----------------------------------------------------------------
+            S_WACK1: begin
+                scl    <= i2c_clk;
+                sda_oe <= 1'b0;  // libera SDA para ACK do escravo
+                if (i2c_fall) begin
+                    // Byte alto do registrador: reg_addr[6:0] + data[8]
+                    shift_reg <= {reg_table[reg_idx][15:9], reg_table[reg_idx][8]};
+                    bit_cnt   <= 3'd7;
+                    state     <= S_REG_HI;
+                    sda_oe    <= 1'b1;
+                end
+            end
+
+            // ----------------------------------------------------------------
+            S_REG_HI: begin
+                scl <= i2c_clk;
+                if (i2c_fall) begin
+                    sda_out <= shift_reg[7];
+                    sda_oe  <= 1'b1;
+                    shift_reg <= {shift_reg[6:0], 1'b0};
+                    if (bit_cnt == 3'd0)
+                        state <= S_WACK2;
+                    else
+                        bit_cnt <= bit_cnt - 3'd1;
+                end
+            end
+
+            // ----------------------------------------------------------------
+            S_WACK2: begin
+                scl    <= i2c_clk;
+                sda_oe <= 1'b0;
+                if (i2c_fall) begin
+                    shift_reg <= reg_table[reg_idx][7:0];
+                    bit_cnt   <= 3'd7;
+                    state     <= S_REG_LO;
+                    sda_oe    <= 1'b1;
+                end
+            end
+
+            // ----------------------------------------------------------------
+            S_REG_LO: begin
+                scl <= i2c_clk;
+                if (i2c_fall) begin
+                    sda_out <= shift_reg[7];
+                    sda_oe  <= 1'b1;
+                    shift_reg <= {shift_reg[6:0], 1'b0};
+                    if (bit_cnt == 3'd0)
+                        state <= S_WACK3;
+                    else
+                        bit_cnt <= bit_cnt - 3'd1;
+                end
+            end
+
+            // ----------------------------------------------------------------
+            S_WACK3: begin
+                scl    <= i2c_clk;
+                sda_oe <= 1'b0;
+                if (i2c_fall)
+                    state <= S_STOP;
+            end
+
+            // ----------------------------------------------------------------
+            // STOP: SDA sobe enquanto SCL está alto
+            S_STOP: begin
+                scl <= i2c_clk;
+                if (i2c_rise) begin
+                    sda_out <= 1'b1;
+                    sda_oe  <= 1'b1;
+                    state   <= S_NEXT;
+                end
+            end
+
+            // ----------------------------------------------------------------
+            S_NEXT: begin
+                if (reg_idx == 4'd7)
+                    state <= S_DONE;
+                else begin
+                    reg_idx <= reg_idx + 4'd1;
+                    state   <= S_START;
+                end
+            end
+
+            // ----------------------------------------------------------------
+            S_DONE: begin
+                done    <= 1'b1;
+                scl     <= 1'b1;
+                sda_out <= 1'b1;
+                sda_oe  <= 1'b1;
+            end
+
+            default: state <= S_IDLE;
+        endcase
+    end
+end
+
+endmodule

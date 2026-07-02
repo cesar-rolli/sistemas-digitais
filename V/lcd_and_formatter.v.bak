@@ -1,0 +1,435 @@
+// =============================================================================
+// lcd_and_formatter.v
+// Módulo 1: freq_to_lcd  — formata frequência em dois arrays de 16 chars ASCII
+// Módulo 2: lcd_controller — drive do HD44780 em modo 4 bits a 50 MHz
+// =============================================================================
+
+// =============================================================================
+// freq_to_lcd
+// Linha 1: "Freq:XXXXXHZ    "   (5 dígitos sem espaço, alinhado à esquerda)
+// Linha 2: "Res:46.9Hz/bin  "   (informativo, fixo)
+// Enquanto aguarda: linha 1 = "Aguardando...   " / linha 2 = "Conecte Line-In "
+// =============================================================================
+module freq_to_lcd (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire [23:0] freq_hz,
+    input  wire        buf_rdy,
+    input  wire        fft_done,
+    output reg  [127:0] line1,
+    output reg  [127:0] line2
+);
+
+// Converte valor de 24 bits para 5 dígitos ASCII (decimal)
+function [39:0] to5dec;
+    input [23:0] n;
+    reg [23:0] t;
+    begin
+        t = n;
+        to5dec[39:32] = (t / 10000) % 10 + 8'h30;
+        to5dec[31:24] = (t / 1000)  % 10 + 8'h30;
+        to5dec[23:16] = (t / 100)   % 10 + 8'h30;
+        to5dec[15: 8] = (t / 10)    % 10 + 8'h30;
+        to5dec[ 7: 0] =  t          % 10 + 8'h30;
+    end
+endfunction
+
+// Linha 2 fixa: "Res:46.9Hz/bin  "
+localparam [127:0] LINE2_FIXED =
+    {8'h52,8'h65,8'h73,8'h3A,   // "Res:"
+     8'h34,8'h36,8'h2E,8'h39,   // "46.9"
+     8'h48,8'h7A,8'h2F,8'h62,   // "Hz/b"
+     8'h69,8'h6E,8'h20,8'h20};  // "in  "
+
+// Linha de espera 1: "Aguardando...   "
+localparam [127:0] LINE1_WAIT =
+    {8'h41,8'h67,8'h75,8'h61,   // "Agua"
+     8'h72,8'h64,8'h61,8'h6E,   // "rdan"
+     8'h64,8'h6F,8'h2E,8'h2E,   // "do.."
+     8'h2E,8'h20,8'h20,8'h20};  // ".   "
+
+// Linha de espera 2: "Conecte Line-In "
+localparam [127:0] LINE2_WAIT =
+    {8'h43,8'h6F,8'h6E,8'h65,   // "Cone"
+     8'h63,8'h74,8'h65,8'h20,   // "cte "
+     8'h4C,8'h69,8'h6E,8'h65,   // "Line"
+     8'h2D,8'h49,8'h6E,8'h20};  // "-In "
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        line1 <= LINE1_WAIT;
+        line2 <= LINE2_WAIT;
+    end else if (!buf_rdy) begin
+        line1 <= LINE1_WAIT;
+        line2 <= LINE2_WAIT;
+    end else if (fft_done) begin
+        begin
+            reg [39:0] fstr;
+            fstr = to5dec(freq_hz);
+            // "Freq:" + 5 dígitos + "Hz   "
+            line1 <= {8'h46, 8'h72, 8'h65, 8'h71, 8'h3A,  // "Freq:"
+                      fstr,                                   // "XXXXX"
+                      8'h48, 8'h7A, 8'h20, 8'h20, 8'h20};  // "Hz   "
+        end
+        line2 <= LINE2_FIXED;
+    end
+end
+
+endmodule
+
+
+// =============================================================================
+// lcd_controller
+// Driver HD44780 em modo 4 bits.
+// Usa apenas LCD_DATA[7:4] (nibble alto).
+// Temporização base: tick de 20 µs (50 MHz / 1000).
+// =============================================================================
+module lcd_controller (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire [127:0] line1,
+    input  wire [127:0] line2,
+    output reg         lcd_rs,
+    output reg         lcd_rw,
+    output reg         lcd_en,
+    output reg  [7:4]  lcd_data
+);
+
+// ---------------------------------------------------------------------------
+// Tick de 20 µs
+// ---------------------------------------------------------------------------
+localparam TICK_DIV = 1000;   // 50 MHz / 1000 = 50 kHz → 20 µs
+reg [9:0] tick_cnt;
+reg       tick;
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin tick_cnt <= 10'd0; tick <= 1'b0; end
+    else begin
+        tick <= 1'b0;
+        if (tick_cnt == TICK_DIV - 1) begin
+            tick_cnt <= 10'd0;
+            tick     <= 1'b1;
+        end else
+            tick_cnt <= tick_cnt + 10'd1;
+    end
+end
+
+// ---------------------------------------------------------------------------
+// Array de 32 caracteres (line1 + line2)
+// ---------------------------------------------------------------------------
+wire [7:0] chars [0:31];
+genvar gi;
+generate
+    for (gi = 0; gi < 16; gi = gi + 1) begin : gen_ch
+        assign chars[gi]    = line1[127 - gi*8 -: 8];
+        assign chars[gi+16] = line2[127 - gi*8 -: 8];
+    end
+endgenerate
+
+// ---------------------------------------------------------------------------
+// FSM de escrita no HD44780
+// Estado de INIT: sequência obrigatória do datasheet
+// ---------------------------------------------------------------------------
+localparam [3:0]
+    S_PWRUP   = 4'd0,   // espera 50 ms após power-on
+    S_INIT1   = 4'd1,   // 0x30 × 3 (força modo 8 bits)
+    S_INIT2   = 4'd2,
+    S_INIT3   = 4'd3,
+    S_INIT4   = 4'd4,   // 0x20 (troca para 4 bits)
+    S_FUNC    = 4'd5,   // Function Set: 2 linhas, fonte 5×8
+    S_DISPOFF = 4'd6,   // Display off
+    S_CLEAR   = 4'd7,   // Clear display
+    S_ENTRY   = 4'd8,   // Entry mode
+    S_DISPON  = 4'd9,   // Display on
+    S_SETL1   = 4'd10,  // DDRAM addr linha 1 (0x00)
+    S_WRCHR   = 4'd11,  // Escreve caracteres
+    S_SETL2   = 4'd12,  // DDRAM addr linha 2 (0x40)
+    S_PAUSE   = 4'd13;  // Pausa antes de reescrever
+
+reg [3:0]  state;
+reg [15:0] wait_cnt;   // em ticks de 20 µs
+reg [5:0]  char_idx;   // 0..31
+reg        nibble;     // 0=hi, 1=lo
+
+// ---------------------------------------------------------------------------
+// Tarefa: envia um nibble e pulsa EN
+// (chamada quando nibble = 0 ou 1 dentro do fluxo)
+// ---------------------------------------------------------------------------
+
+// Sequenciador de nibble: cada byte gera 2 transações de nibble
+// Estados intermediários controlados por wait_cnt local
+
+// Para simplificar: cada estado de "envio" usa wait_cnt assim:
+//   wait_cnt == 0 : coloca dado, EN=1
+//   wait_cnt == 1 : EN=0   (pulso ≥ 20 µs ✓)
+//   wait_cnt == 2 : avança estado (tempo total ≥ 40 µs → dentro do spec)
+
+task send_nibble_hi;
+    input rs_v;
+    input [7:0] byte_v;
+    begin
+        lcd_rs   <= rs_v;
+        lcd_rw   <= 1'b0;
+        lcd_data <= byte_v[7:4];
+        lcd_en   <= 1'b1;
+    end
+endtask
+
+task send_nibble_lo;
+    input rs_v;
+    input [7:0] byte_v;
+    begin
+        lcd_rs   <= rs_v;
+        lcd_rw   <= 1'b0;
+        lcd_data <= byte_v[3:0];
+        lcd_en   <= 1'b1;
+    end
+endtask
+
+// Estados de sub-sequência: HI nibble (3 ticks) + LO nibble (3 ticks) = 6 ticks/byte
+// wait_cnt: 0→EN hi alto, 1→EN alto baixo, 2→pausa, 3→EN lo alto, 4→EN lo baixo, 5→avança
+
+reg [7:0] cmd_byte;
+reg       cmd_rs;
+reg [3:0] next_state_after_cmd;
+reg [3:0] cmd_state;  // estado para o motor de envio de byte
+
+localparam CMD_IDLE = 4'd0, CMD_HI1 = 4'd1, CMD_HI2 = 4'd2,
+           CMD_GAP  = 4'd3, CMD_LO1 = 4'd4, CMD_LO2 = 4'd5,
+           CMD_WAIT = 4'd6;
+
+// Motor de envio (embutido na FSM principal usando sub-contador)
+// Optamos por uma abordagem flat: cada estado da FSM cuida do seu próprio timing
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        state      <= S_PWRUP;
+        wait_cnt   <= 16'd0;
+        char_idx   <= 6'd0;
+        nibble     <= 1'b0;
+        lcd_rs     <= 1'b0;
+        lcd_rw     <= 1'b0;
+        lcd_en     <= 1'b0;
+        lcd_data   <= 4'h0;
+    end else if (tick) begin
+        lcd_en <= 1'b0;   // default: EN baixo
+
+        case (state)
+
+            // ---------------------------------------------------------
+            // Espera 50 ms = 2500 ticks de 20 µs
+            S_PWRUP: begin
+                if (wait_cnt == 16'd2500) begin
+                    wait_cnt <= 16'd0;
+                    state    <= S_INIT1;
+                end else
+                    wait_cnt <= wait_cnt + 16'd1;
+            end
+
+            // ---------------------------------------------------------
+            // INIT1: envia 0x3_ (nibble alto 0x3) — 8-bit function set #1
+            // Após cada um desses precisamos de 5 ms de espera
+            S_INIT1: begin
+                case (wait_cnt)
+                    0: begin lcd_rs<=1'b0; lcd_data<=4'h3; lcd_en<=1'b1; wait_cnt<=1; end
+                    1: begin lcd_en<=1'b0; wait_cnt<=2; end
+                    2: begin  // espera 5 ms = 250 ticks
+                        if (wait_cnt < 252) wait_cnt <= wait_cnt + 1;
+                        else begin wait_cnt<=0; state<=S_INIT2; end
+                    end
+                    default: wait_cnt <= wait_cnt + 1;
+                endcase
+            end
+
+            S_INIT2: begin
+                case (wait_cnt)
+                    0: begin lcd_rs<=1'b0; lcd_data<=4'h3; lcd_en<=1'b1; wait_cnt<=1; end
+                    1: begin lcd_en<=1'b0; wait_cnt<=2; end
+                    default: begin
+                        if (wait_cnt < 12) wait_cnt<=wait_cnt+1;  // ~200 µs
+                        else begin wait_cnt<=0; state<=S_INIT3; end
+                    end
+                endcase
+            end
+
+            S_INIT3: begin
+                case (wait_cnt)
+                    0: begin lcd_rs<=1'b0; lcd_data<=4'h3; lcd_en<=1'b1; wait_cnt<=1; end
+                    1: begin lcd_en<=1'b0; wait_cnt<=2; end
+                    default: begin
+                        if (wait_cnt < 6) wait_cnt<=wait_cnt+1;
+                        else begin wait_cnt<=0; state<=S_INIT4; end
+                    end
+                endcase
+            end
+
+            // Troca para 4 bits: envia apenas nibble 0x2
+            S_INIT4: begin
+                case (wait_cnt)
+                    0: begin lcd_rs<=1'b0; lcd_data<=4'h2; lcd_en<=1'b1; wait_cnt<=1; end
+                    1: begin lcd_en<=1'b0; wait_cnt<=2; end
+                    default: begin
+                        if (wait_cnt < 4) wait_cnt<=wait_cnt+1;
+                        else begin wait_cnt<=0; state<=S_FUNC; end
+                    end
+                endcase
+            end
+
+            // ---------------------------------------------------------
+            // A partir daqui: modo 4 bits — 2 nibbles por byte
+            // Macro de envio inline: 6 sub-passos por byte
+
+            // Function Set: 0x28 = N=1(2lines), F=0(5x8)
+            S_FUNC: begin
+                case (wait_cnt)
+                    0: begin lcd_rs<=0; lcd_data<=4'h2; lcd_en<=1; wait_cnt<=1; end
+                    1: begin lcd_en<=0; wait_cnt<=2; end
+                    2: begin lcd_rs<=0; lcd_data<=4'h8; lcd_en<=1; wait_cnt<=3; end
+                    3: begin lcd_en<=0; wait_cnt<=4; end
+                    default: begin
+                        if (wait_cnt<6) wait_cnt<=wait_cnt+1;
+                        else begin wait_cnt<=0; state<=S_DISPOFF; end
+                    end
+                endcase
+            end
+
+            // Display Off: 0x08
+            S_DISPOFF: begin
+                case (wait_cnt)
+                    0: begin lcd_rs<=0; lcd_data<=4'h0; lcd_en<=1; wait_cnt<=1; end
+                    1: begin lcd_en<=0; wait_cnt<=2; end
+                    2: begin lcd_rs<=0; lcd_data<=4'h8; lcd_en<=1; wait_cnt<=3; end
+                    3: begin lcd_en<=0; wait_cnt<=4; end
+                    default: begin
+                        if (wait_cnt<6) wait_cnt<=wait_cnt+1;
+                        else begin wait_cnt<=0; state<=S_CLEAR; end
+                    end
+                endcase
+            end
+
+            // Clear Display: 0x01 (precisa de 1.6 ms = 80 ticks após)
+            S_CLEAR: begin
+                case (wait_cnt)
+                    0: begin lcd_rs<=0; lcd_data<=4'h0; lcd_en<=1; wait_cnt<=1; end
+                    1: begin lcd_en<=0; wait_cnt<=2; end
+                    2: begin lcd_rs<=0; lcd_data<=4'h1; lcd_en<=1; wait_cnt<=3; end
+                    3: begin lcd_en<=0; wait_cnt<=4; end
+                    default: begin
+                        if (wait_cnt<84) wait_cnt<=wait_cnt+1;  // 80 ticks = 1.6 ms
+                        else begin wait_cnt<=0; state<=S_ENTRY; end
+                    end
+                endcase
+            end
+
+            // Entry Mode: 0x06 (I/D=1, S=0)
+            S_ENTRY: begin
+                case (wait_cnt)
+                    0: begin lcd_rs<=0; lcd_data<=4'h0; lcd_en<=1; wait_cnt<=1; end
+                    1: begin lcd_en<=0; wait_cnt<=2; end
+                    2: begin lcd_rs<=0; lcd_data<=4'h6; lcd_en<=1; wait_cnt<=3; end
+                    3: begin lcd_en<=0; wait_cnt<=4; end
+                    default: begin
+                        if (wait_cnt<6) wait_cnt<=wait_cnt+1;
+                        else begin wait_cnt<=0; state<=S_DISPON; end
+                    end
+                endcase
+            end
+
+            // Display On: 0x0C (D=1, C=0, B=0)
+            S_DISPON: begin
+                case (wait_cnt)
+                    0: begin lcd_rs<=0; lcd_data<=4'h0; lcd_en<=1; wait_cnt<=1; end
+                    1: begin lcd_en<=0; wait_cnt<=2; end
+                    2: begin lcd_rs<=0; lcd_data<=4'hC; lcd_en<=1; wait_cnt<=3; end
+                    3: begin lcd_en<=0; wait_cnt<=4; end
+                    default: begin
+                        if (wait_cnt<6) wait_cnt<=wait_cnt+1;
+                        else begin wait_cnt<=0; char_idx<=0; state<=S_SETL1; end
+                    end
+                endcase
+            end
+
+            // ---------------------------------------------------------
+            // Set DDRAM addr linha 1: 0x80
+            S_SETL1: begin
+                case (wait_cnt)
+                    0: begin lcd_rs<=0; lcd_data<=4'h8; lcd_en<=1; wait_cnt<=1; end
+                    1: begin lcd_en<=0; wait_cnt<=2; end
+                    2: begin lcd_rs<=0; lcd_data<=4'h0; lcd_en<=1; wait_cnt<=3; end
+                    3: begin lcd_en<=0; wait_cnt<=4; end
+                    default: begin
+                        if (wait_cnt<6) wait_cnt<=wait_cnt+1;
+                        else begin wait_cnt<=0; char_idx<=0; state<=S_WRCHR; end
+                    end
+                endcase
+            end
+
+            // ---------------------------------------------------------
+            // Escreve chars[0..31]
+            // Após char 15, insere DDRAM addr 0xC0 (linha 2)
+            S_WRCHR: begin
+                case (wait_cnt)
+                    0: begin
+                        lcd_rs   <= 1'b1;
+                        lcd_data <= chars[char_idx][7:4];
+                        lcd_en   <= 1'b1;
+                        wait_cnt <= 1;
+                    end
+                    1: begin lcd_en<=0; wait_cnt<=2; end
+                    2: begin
+                        lcd_rs   <= 1'b1;
+                        lcd_data <= chars[char_idx][3:0];
+                        lcd_en   <= 1'b1;
+                        wait_cnt <= 3;
+                    end
+                    3: begin lcd_en<=0; wait_cnt<=4; end
+                    default: begin
+                        if (wait_cnt<6) begin
+                            wait_cnt <= wait_cnt+1;
+                        end else begin
+                            wait_cnt <= 0;
+                            if (char_idx == 6'd15) begin
+                                // Vai para linha 2
+                                state <= S_SETL2;
+                            end else if (char_idx == 6'd31) begin
+                                // Terminou — pausa
+                                state <= S_PAUSE;
+                            end else begin
+                                char_idx <= char_idx + 6'd1;
+                            end
+                        end
+                    end
+                endcase
+            end
+
+            // ---------------------------------------------------------
+            // Set DDRAM addr linha 2: 0xC0
+            S_SETL2: begin
+                case (wait_cnt)
+                    0: begin lcd_rs<=0; lcd_data<=4'hC; lcd_en<=1; wait_cnt<=1; end
+                    1: begin lcd_en<=0; wait_cnt<=2; end
+                    2: begin lcd_rs<=0; lcd_data<=4'h0; lcd_en<=1; wait_cnt<=3; end
+                    3: begin lcd_en<=0; wait_cnt<=4; end
+                    default: begin
+                        if (wait_cnt<6) wait_cnt<=wait_cnt+1;
+                        else begin wait_cnt<=0; char_idx<=16; state<=S_WRCHR; end
+                    end
+                endcase
+            end
+
+            // ---------------------------------------------------------
+            // Pausa ~200 ms = 10000 ticks, depois reescreve
+            S_PAUSE: begin
+                if (wait_cnt == 16'd10000) begin
+                    wait_cnt <= 0;
+                    state    <= S_SETL1;
+                end else
+                    wait_cnt <= wait_cnt + 1;
+            end
+
+            default: state <= S_PWRUP;
+        endcase
+    end
+end
+
+endmodule
